@@ -1,0 +1,168 @@
+# General pretrain corpus (MDS), 1024-token split.
+data_local: /path/to/mds/general_pretrain_1024tok
+data_remote: # If blank, files must be present in data_local
+
+max_seq_len: 1024
+tokenizer_name: /path/to/tokenizer/doctomodernbert-fr-vocab50280
+mlm_probability: 0.3 # FlexBERT should use 30% masking for optimal performance
+count_padding_tokens: false
+
+# Run Name
+run_name: doctomodernbert-fr-large-stage1
+
+# Model
+model:
+  name: flex_bert
+  pretrained_model_name: bert-base-uncased # has to be set to bert-base-uncased legacy reasons
+  tokenizer_name: ${tokenizer_name}
+  disable_train_metrics: true # save some time by not computing metrics on the training set
+  model_config:
+    vocab_size: 50368
+    init_method: full_megatron
+    num_hidden_layers: 28
+    hidden_size: 1024
+    intermediate_size: 2624
+    num_attention_heads: 16 # to have head size of 64
+    attention_layer: rope
+    attention_probs_dropout_prob: 0.0
+    attn_out_bias: false
+    attn_out_dropout_prob: 0.1
+    attn_qkv_bias: false
+    bert_layer: prenorm
+    embed_dropout_prob: 0.0
+    embed_norm: true
+    final_norm: true
+    skip_first_prenorm: true
+    embedding_layer: sans_pos
+    loss_function: fa_cross_entropy
+    loss_kwargs:
+      reduction: mean
+    mlp_dropout_prob: 0.0
+    mlp_in_bias: false
+    mlp_layer: glu
+    mlp_out_bias: false
+    normalization: layernorm
+    norm_kwargs:
+      eps: 1e-5
+      bias: false
+    hidden_act: gelu
+    head_pred_act: gelu
+    activation_function: gelu # better safe than sorry
+    padding: unpadded
+    rotary_emb_dim: null
+    rotary_emb_base: 10000.0
+    rotary_emb_scale_base: null
+    rotary_emb_interleaved: false
+    allow_embedding_resizing: true
+    sliding_window: 128
+    global_attn_every_n_layers: 3
+    unpad_embeddings: true
+    compile_model: true
+    masked_prediction: true
+
+# Dataloaders
+train_loader:
+  name: text
+  dataset:
+    local: ${data_local}
+    remote: ${data_remote}
+    split: train
+    tokenizer_name: ${tokenizer_name}
+    max_seq_len: ${max_seq_len}
+    shuffle: true
+    mlm_probability: ${mlm_probability}
+    streaming: false
+  drop_last: true
+  num_workers: 6
+  sequence_packing: true
+  batch_size_warmup_min_size: ${device_train_microbatch_size}
+  batch_size_warmup_tokens: 3_000_000_000tok
+  # batch_size_warmup_tokens: 6_000_000_000tok
+  # persistent_workers: false  # for resume
+
+eval_loader:
+  name: text
+  dataset:
+    local: ${data_local}
+    remote: ${data_remote}
+    split: validation
+    tokenizer_name: ${tokenizer_name}
+    max_seq_len: ${max_seq_len}
+    shuffle: false
+    mlm_probability: 0.15 # We always evaluate at 15% masking for consistent comparison
+    streaming: false
+  drop_last: false
+  num_workers: 3
+  sequence_packing: false
+  # persistent_workers: false  # for resume
+
+# Optimization
+scheduler:
+  name: warmup_stable_decay
+  t_warmup: 1_000_000_000tok
+  alpha_f: 0.00
+  t_decay: 0tok
+
+optimizer:
+  name: decoupled_stableadamw
+  lr: 3e-4 # peak LR (5e-4 was too high at this scale)
+  betas:
+  - 0.9
+  - 0.98
+  eps: 1.0e-06
+  weight_decay: 1.0e-5 # Amount of weight decay regularization
+  filter_bias_norm_wd: true # If True, doesn't apply weight decay to norm layers and biases
+  log_grad_norm: true
+
+max_duration: 100_000_000_000tok
+eval_interval: 4_000_000_000tok
+global_train_batch_size: 4928
+global_eval_batch_size: 896
+
+# Initialize the large model from the base P1 checkpoint: reads
+# {checkpoint_load_path}/{checkpoint_run_name}/latest-rank0.pt, rebuilds the base from
+# checkpoint_cfg, then Gopher depth-scales (22→28L) + Phi width-tiles (768→1024, 1152→2624).
+# checkpoint_cfg only needs to match the base arch (22L/768, rope/sans_pos/glu/prenorm/unpadded, vocab 50368).
+init_from_checkpoint:
+  checkpoint_cfg: yamls/doctobert_fr/modernbert-base-pretrain.yaml  # base arch (matches the seed)
+  checkpoint_load_path: /path/to/checkpoints          # no trailing slash
+  checkpoint_run_name: doctomodernbert-fr-base-stage1
+  mode: tile_weights_from_middle
+
+# System
+seed: 314
+device_eval_batch_size: 112
+device_train_microbatch_size: 56
+precision: amp_bf16
+
+# Logging
+progress_bar: false
+log_to_console: true
+console_log_interval: 100ba
+
+callbacks:
+  speed_monitor:
+    window_size: 50
+  lr_monitor: {}
+  scheduled_gc: {}
+  log_grad_norm:
+    batch_log_interval: 10
+  packing_efficiency:
+    log_interval: 10
+
+# logging
+loggers:
+  tensorboard:
+    log_dir: /path/to/logs/tensorboard
+    flush_interval: 100
+  wandb:
+    project: your-wandb-project
+#     entity:
+
+# Checkpoint to local filesystem or remote object store
+save_interval: 4_000_000_000tok
+save_num_checkpoints_to_keep: -1  # Important, this cleans up checkpoints saved to DISK
+save_folder: /path/to/checkpoints/{run_name}
+
+# Load from local filesystem or remote object store to
+# load_path: null

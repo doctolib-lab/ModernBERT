@@ -19,10 +19,10 @@ from src.bert_layers.model import init_mlm_model_from_pretrained
 # Add folder root to path to allow us to use relative imports regardless of what directory the script is run from
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 
-from composer import Evaluator, Trainer, algorithms
+from composer import Callback, Evaluator, Trainer, algorithms
 from composer.callbacks import LRMonitor, MemoryMonitor, OptimizerMonitor, RuntimeEstimator, SpeedMonitor
 from composer.core import DataSpec
-from composer.loggers import WandBLogger
+from composer.loggers import WandBLogger, TensorboardLogger
 from composer.optim import DecoupledAdamW
 from composer.optim.scheduler import (
     ConstantWithWarmupScheduler,
@@ -46,6 +46,7 @@ from src.callbacks.packing_efficiency import PackingEfficency
 from src.callbacks.scheduled_gc import ScheduledGarbageCollector
 from src.scheduler import CosineInverseSqrtScheduler, OneMinusSqrtScheduler, WarmupStableDecayScheduler
 from src.sequence_packer import get_num_samples_in_packed_batch, split_packed_batch
+from src.callbacks.mlm_probability_scheduler import MLMProbabilityLinearDecay
 
 
 def update_batch_size_info(cfg: DictConfig):
@@ -174,6 +175,12 @@ def build_callback(name, kwargs):
         return DataloaderSpeedMonitor()
     elif name == "packing_efficiency":
         return PackingEfficency(log_interval=kwargs.get("log_interval", 10))
+    elif name == "mlm_probability_scheduler":
+        return MLMProbabilityLinearDecay(
+            initial_prob=kwargs.get("initial_prob"),
+            final_prob=kwargs.get("final_prob"),
+            log_interval=kwargs.get("log_interval", 100),
+        )
     else:
         raise ValueError(f"Not sure how to build callback: {name}")
 
@@ -181,6 +188,8 @@ def build_callback(name, kwargs):
 def build_logger(name, kwargs):
     if name == "wandb":
         return WandBLogger(**kwargs)
+    if name == "tensorboard":
+        return TensorboardLogger(**kwargs)
     else:
         raise ValueError(f"Not sure how to build logger: {name}")
 
@@ -207,7 +216,12 @@ def build_scheduler(cfg):
             cooldown_schedule=cfg.get("cooldown_schedule", "linear"),
         )
     elif cfg.name == "one_minus_sqrt":
-        return OneMinusSqrtScheduler(t_decay=cfg.t_decay, t_max=cfg.t_max, alpha_f=cfg.alpha_f)
+        return OneMinusSqrtScheduler(
+            t_decay=cfg.t_decay,
+            t_max=cfg.t_max,
+            alpha_f=cfg.alpha_f,
+            t_warmup=cfg.get("t_warmup", "0tok"),
+        )
     else:
         raise ValueError(f"Not sure how to build scheduler: {cfg.name}")
 
@@ -390,6 +404,31 @@ def main(cfg: DictConfig, return_trainer: bool = False, do_train: bool = True) -
         count_padding_tokens=cfg.get("count_padding_tokens", True),
         device_microbatch_size=cfg.device_train_microbatch_size,
     )
+    # Optional: drop specific batches from the train stream (e.g., known bad-batch
+    # ranges from a prior failed run). Top-level yaml key, opt-in. Absent key →
+    # no import, no behavior change for existing runs.
+    skip_cfg = cfg.get("skip_batches_in_range")
+    if skip_cfg is not None and skip_cfg.get("ranges"):
+        import re
+        from src.data.skip_batch_iterator import SkipBatchIterator
+
+        # Derive `start_offset` from the load_path filename so the user's `ranges`
+        # refer to Composer's GLOBAL batch index (matching the loss-plot batch
+        # numbers), not "batches since iteration started". Without this, the
+        # wrapper's local counter starts at 0 on each resume and the skip window
+        # would never align with the original bad-batch position.
+        start_offset = 0
+        load_path = cfg.get("load_path") or ""
+        m = re.search(r"-ba(\d+)-rank0\.pt$", load_path)
+        if m:
+            start_offset = int(m.group(1))
+        train_loader.dataloader = SkipBatchIterator(
+            train_loader.dataloader, list(skip_cfg["ranges"]), start_offset=start_offset
+        )
+        print(
+            f"[skip_batches_in_range] active — ranges={list(skip_cfg['ranges'])}, "
+            f"start_offset={start_offset} (parsed from load_path)"
+        )
     if cfg.get("eval_loader", None) is not None:
         print("Building eval loader...")
         global_eval_batch_size = cfg.get("global_eval_batch_size", cfg.global_train_batch_size)
@@ -417,6 +456,13 @@ def main(cfg: DictConfig, return_trainer: bool = False, do_train: bool = True) -
 
     # Callbacks
     callbacks = [build_callback(name, callback_cfg) for name, callback_cfg in cfg.get("callbacks", {}).items()]
+
+    if cfg.get("clipping_threshold", 0) > 0:
+        _clip_threshold = cfg.clipping_threshold
+        class _GradClipCb(Callback):
+            def after_backward(self, state, logger):
+                torch.nn.utils.clip_grad_norm_(state.model.parameters(), _clip_threshold)
+        callbacks.append(_GradClipCb())
 
     # Algorithms
     if (

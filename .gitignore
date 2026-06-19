@@ -167,3 +167,13 @@ wandb/
 
 # OS X
 .DS_Store
+
+# Cursor
+._*
+
+# training
+logs/
+wandb/
+wandb_*.tar.gz
+tmp*
+dev*

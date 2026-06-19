@@ -263,10 +263,22 @@ class CosineInverseSqrtScheduler(ComposerScheduler):
 
 class OneMinusSqrtScheduler(ComposerScheduler):
     """
-    Decays the learning rate according to a 1 - sqrt function, without an initial warmup phase.
-    The learning rate decays from 1 to alpha_f according to the formula:
-    f(n, N_T, N_C) = alpha_f + (1 - alpha_f)(1 - sqrt((n - (N_T - N_C)) / N_C))
-    where N_T is t_max and N_C is t_decay.
+    Decays the learning rate according to a 1 - sqrt function, with an optional linear warmup.
+
+    Schedule phases:
+      [0, t_warmup)          — linear warmup from ~0 to peak LR
+      [t_warmup, t_max - t_decay) — constant at peak LR (stable phase)
+      [t_max - t_decay, t_max]   — sqrt decay from peak to alpha_f
+
+    LR formula during decay:
+      f = alpha_f + (1 - alpha_f) * (1 - sqrt((t - (t_max - t_decay)) / t_decay))
+
+    Args:
+        t_decay: Duration of the sqrt-decay phase. Default ``"0.1dur"``.
+        t_max: Total schedule duration. Default ``"1dur"``.
+        alpha_f: Final LR multiplier at end of decay. Default ``0.1``.
+        t_warmup: Linear warmup duration. Default ``"0tok"`` (no warmup, preserves
+                  original behaviour when omitted).
     """
 
     def __init__(
@@ -274,16 +286,23 @@ class OneMinusSqrtScheduler(ComposerScheduler):
         t_decay: Union[str, Time] = "0.1dur",
         t_max: Union[str, Time] = "1dur",
         alpha_f: float = 0.1,
+        t_warmup: Union[str, Time] = "0tok",
     ):
         self.t_decay = t_decay
         self.t_max = t_max
         self.alpha_f = alpha_f
+        self.t_warmup = t_warmup
+        self.warmup_scheduler = LinearScheduler(alpha_i=1e-10, alpha_f=1.0, t_max=t_warmup)
 
     def __call__(self, state: State, ssr: float = 1.0):
         assert state.max_duration is not None, "max_duration should be set whenever schedulers are invoked"
 
+        t_warmup = _convert_time(self.t_warmup, state)
         t_decay = _convert_time(self.t_decay, state)
         t_max = _convert_time(self.t_max, state, ssr=ssr)
+
+        if t_warmup.value > 0 and state.timestamp < t_warmup:
+            return self.warmup_scheduler(state)
 
         current_time = state.timestamp.get(t_max.unit)
 

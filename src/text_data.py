@@ -203,7 +203,7 @@ class StreamingTextDataset(StreamingDataset):
 
     # How to tokenize a text sample to a token sample
     def _tokenize(self, text_sample):
-        if self.tokenizer._pad_token is None:
+        if self.tokenizer.pad_token is None:
             # Some tokenizers (e.g. GPT2 tokenizer) have no padding token which causes bugs
             raise RuntimeError("If tokenizing on-the-fly, tokenizer must have a pad_token_id")
 
@@ -387,7 +387,17 @@ def build_text_dataloader(
             drop_last=cfg.drop_last,
         )
 
-    mlm_probability = cfg.dataset.get("mlm_probability", None)
+    # mlm_probability = cfg.dataset.get("mlm_probability", None)
+    # Support linear decay: prefer "initial_mlm_probability" and "final_mlm_probability" if provided.
+    initial_mlm_probability = cfg.dataset.get("initial_mlm_probability", None)
+
+    # Fallback for backward compatibility
+    if initial_mlm_probability is None:
+        initial_mlm_probability = cfg.dataset.get("mlm_probability", None)
+
+    # `final_mlm_probability` is only needed for the scheduler callback; we don't use it directly here.
+    mlm_probability = initial_mlm_probability
+
     # only use sequence packing if using the no_streaming_dataset
     if not cfg.dataset.get("streaming", True) and cfg.get("sequence_packing", False):
         dataloader = DataLoader(
@@ -482,7 +492,7 @@ class NoStreamingDataset(Dataset):
 
     def _tokenize(self, text_sample):
         assert self.tokenizer is not None, "Tokenizer required if data is not pretokenized"
-        if self.tokenizer._pad_token is None:
+        if self.tokenizer.pad_token is None:
             # Some tokenizers (e.g. GPT2 tokenizer) have no padding token which causes bugs
             raise RuntimeError("If tokenizing on-the-fly, tokenizer must have a pad_token_id")
 

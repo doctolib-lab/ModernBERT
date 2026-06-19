@@ -1,0 +1,133 @@
+# General pretrain corpus (MDS), 512-token split, vocab_32680 (RoBERTa).
+data_local: /path/to/mds/general_pretrain_512tok_vocab32680
+data_remote: # If blank, files must be present in data_local
+
+max_seq_len: 512
+tokenizer_name: /path/to/tokenizer/doctoroberta-fr-vocab32680  # RoBERTa variant: low-id specials (pad=1)
+mlm_probability: 0.15 # Roberta pretraining uses 15% masking
+count_padding_tokens: false
+
+# Run Name
+run_name: doctoroberta-fr-base-stage1
+
+# Model
+model:
+  name: hf_bert
+  use_pretrained: false
+  pretrained_model_name: roberta-base
+  tokenizer_name: ${tokenizer_name}
+  disable_train_metrics: true # save some time by not computing metrics on the training set
+  model_config:
+    model_type: roberta
+    vocab_size: 32768
+    hidden_size: 768
+    intermediate_size: 3072  # 4x hidden, like Roberta
+    num_attention_heads: 12 # bert-base default
+    num_hidden_layers: 12 # bert-base default
+    max_position_embeddings: 514  # HF roberta-base convention: max_seq_len(512) + pad_idx(1) + 1. Without the +2, position table can hold only seq_len ≤ 510 (RoBERTa offset formula: position_id = cumsum + pad_token_id, max = L+1).
+    attention_probs_dropout_prob: 0.1
+    hidden_act: gelu
+    hidden_dropout_prob: 0.1
+    layer_norm_eps: 1.0e-12
+    initializer_range: 0.02
+    position_embedding_type: absolute
+
+# Dataloaders
+train_loader:
+  name: text
+  dataset:
+    local: ${data_local}
+    remote: ${data_remote}
+    split: train
+    tokenizer_name: ${tokenizer_name}
+    max_seq_len: ${max_seq_len}
+    shuffle: true
+    mlm_probability: ${mlm_probability}
+    streaming: false
+  drop_last: true
+  num_workers: 6
+  sequence_packing: false
+  # batch_size_warmup_min_size: ${device_train_microbatch_size}
+  # batch_size_warmup_tokens: 600_000_000tok
+  persistent_workers: false  # for resume
+
+eval_loader:
+  name: text
+  dataset:
+    local: ${data_local}
+    remote: ${data_remote}
+    split: validation
+    tokenizer_name: ${tokenizer_name}
+    max_seq_len: ${max_seq_len}
+    shuffle: false
+    mlm_probability: 0.15 # We always evaluate at 15% masking for consistent comparison
+    streaming: false
+  drop_last: false
+  num_workers: 3
+  sequence_packing: false
+  persistent_workers: false  # for resume
+
+# Optimization
+scheduler:
+  name: linear_decay_with_warmup
+  t_warmup: 25_000_000_000tok     # 5% of the 500B horizon
+  alpha_f: 0.00 # linear decay to 0 by end of training
+
+optimizer:
+  name: decoupled_stableadamw
+  lr: 3e-4 # peak LR (a higher 5e-4 caused a mid-run loss spike at this scale)
+  betas:
+  - 0.9
+  - 0.98
+  eps: 1.0e-06
+  weight_decay: 1.0e-5 # Amount of weight decay regularization
+  filter_bias_norm_wd: true # If True, doesn't apply weight decay to norm layers and biases
+  log_grad_norm: true
+
+max_duration: 500_000_000_000tok
+eval_interval: 10_000_000_000tok
+global_train_batch_size: 5120
+global_eval_batch_size: 1024
+
+# System
+seed: 17
+device_eval_batch_size: 64
+device_train_microbatch_size: 160
+precision: amp_bf16
+
+# Logging
+progress_bar: false
+log_to_console: true
+console_log_interval: 10ba
+
+callbacks:
+  speed_monitor:
+    window_size: 50
+  lr_monitor: {}
+  scheduled_gc: {}
+  log_grad_norm:
+    batch_log_interval: 10
+  packing_efficiency:
+    log_interval: 10
+
+# logging
+loggers:
+  tensorboard:
+    log_dir: /path/to/logs/tensorboard
+    flush_interval: 100
+  wandb:
+    project: your-wandb-project
+#     entity:
+
+# Checkpoint to local filesystem or remote object store
+save_interval: 10_000_000_000tok
+save_num_checkpoints_to_keep: -1  # Important, this cleans up checkpoints saved to DISK
+save_folder: /path/to/checkpoints/{run_name}
+
+# Load from local filesystem or remote object store to
+# load_path:   # stage 1 trains from scratch
+
+# On a timeout resume, set an explicit load_path and:
+# autoresume: false
+# reset_time: false         # full-state: keep scheduler clock + optimizer + data position
+# restart_override: false   # keep optimizer and LR-scheduler settings
